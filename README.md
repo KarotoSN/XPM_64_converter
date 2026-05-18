@@ -1,6 +1,10 @@
-# XPM 64 Converter
+# XPM 64 Converter 🎨
 
 A tool that automatically resizes images to 64x64 resolution and converts them into the XPM format required for 42 graphic projects.
+
+<p align="center">
+  <img src="./asset/present.png" alt="Aperçu du convertisseur XPM" width="900" />
+</p>
 
 ## Description
 
@@ -8,7 +12,6 @@ XPM 64 Converter is designed to simplify the image preparation workflow for 42 S
 
 - Resizes the image to 64x64 pixels
 - Converts it to XPM format (.xpm)
-- Generates the necessary code for immediate use in your projects
 
 ## Features
 
@@ -26,10 +29,6 @@ XPM 64 Converter is designed to simplify the image preparation workflow for 42 S
 ## Supported Input Formats
 
 - Common image formats (JPG, PNG, BMP, GIF, etc.)
-
-## Requirements
-
-- Modern web browser with JavaScript support
 
 ## License
 
