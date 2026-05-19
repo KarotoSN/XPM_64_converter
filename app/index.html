@@ -233,6 +233,19 @@
       </div>
     </div>
 
+    <!-- Remove background toggle -->
+    <div class="hq-row" id="bg-row" onclick="toggleBG()">
+      <div class="toggle" id="bg-toggle"><div class="toggle-knob"></div></div>
+      <div class="hq-text">
+        <span class="hq-name">Remove background</span>
+        <span class="hq-hint" id="bg-hint">perceptual flood-fill · feathered edges · tolerance <span id="tol-val">30</span></span>
+      </div>
+      <input type="range" id="tol-slider" min="5" max="120" value="30"
+        onclick="event.stopPropagation()"
+        oninput="event.stopPropagation(); onTolChange(this.value)"
+        style="margin-left:auto; width:80px; accent-color:var(--accent); cursor:pointer; flex-shrink:0;">
+    </div>
+
     <div class="controls">
       <input type="text" id="filename-input" value="icon_64" placeholder="filename (no extension)">
       <button id="btn-download" onclick="downloadXPM()">⬇ download .xpm</button>
@@ -243,7 +256,7 @@
 </div>
 
 <script>
-  let xpmContent = '', hq = false, currentImg = null;
+  let xpmContent = '', hq = false, removeBg = false, bgTolerance = 30, currentImg = null;
 
   const dropZone       = document.getElementById('drop-zone');
   const fileInput      = document.getElementById('file-input');
@@ -295,20 +308,194 @@
   }
 
   function render() {
+    // always work from original full-res pixels
+    let src = canvasOrig.getContext('2d').getImageData(0, 0, currentImg.naturalWidth, currentImg.naturalHeight);
+
+    // remove bg on full-res first (much cleaner than on 64×64)
+    if (removeBg) src = removeBackground(src, currentImg.naturalWidth, currentImg.naturalHeight, bgTolerance);
+
     let scaled;
     if (hq) {
-      const src = canvasOrig.getContext('2d').getImageData(0, 0, currentImg.naturalWidth, currentImg.naturalHeight);
       scaled = resizeLanczos(src, currentImg.naturalWidth, currentImg.naturalHeight, 64, 64);
       scaled = unsharpMask(scaled, 64, 64);
       scaled = floydSteinberg(scaled, 64, 64);
-      canvasScaled.getContext('2d').putImageData(scaled, 0, 0);
     } else {
+      // draw the (possibly bg-removed) source into an offscreen canvas, then scale
+      const tmp = document.createElement('canvas');
+      tmp.width = currentImg.naturalWidth; tmp.height = currentImg.naturalHeight;
+      tmp.getContext('2d').putImageData(src, 0, 0);
       const ctx = canvasScaled.getContext('2d');
       ctx.clearRect(0, 0, 64, 64);
-      ctx.drawImage(currentImg, 0, 0, currentImg.naturalWidth, currentImg.naturalHeight, 0, 0, 64, 64);
+      ctx.drawImage(tmp, 0, 0, currentImg.naturalWidth, currentImg.naturalHeight, 0, 0, 64, 64);
+      scaled = ctx.getImageData(0, 0, 64, 64);
     }
+    canvasScaled.getContext('2d').putImageData(scaled, 0, 0);
     const name = (document.getElementById('filename-input').value.trim() || 'icon_64').replace(/[^a-zA-Z0-9_]/g, '_');
     xpmContent = generateXPM(canvasScaled, name);
+  }
+
+  function toggleBG() {
+    removeBg = !removeBg;
+    document.getElementById('bg-toggle').classList.toggle('on', removeBg);
+    document.getElementById('bg-row').classList.toggle('on', removeBg);
+    if (currentImg) render();
+  }
+
+  function onTolChange(val) {
+    bgTolerance = parseInt(val);
+    document.getElementById('tol-val').textContent = val;
+    if (removeBg && currentImg) render();
+  }
+
+  /* ── Background removal ──────────────────────────────────────────────────
+     Strategy:
+     1. Convert to CIE L*a*b* for perceptual colour distance (much better than RGB sum)
+     2. Flood-fill every pixel on ALL four edges as seeds (not just corners)
+     3. Build a float alpha-mask (0 = bg, 1 = fg)
+     4. Gaussian-blur the mask slightly then threshold → smooth edge without blur bleed
+     5. Apply mask back to RGBA
+  ─────────────────────────────────────────────────────────────────────── */
+  function removeBackground(imgData, w, h, tol) {
+    const src = imgData.data;
+    const out = new ImageData(w, h);
+    out.data.set(src);
+    const od = out.data;
+
+    // ── RGB → Lab helpers ──
+    function srgbToLinear(v) {
+      v /= 255;
+      return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    }
+    function labF(t) { return t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16/116; }
+    function rgbToLab(r, g, b) {
+      const rl = srgbToLinear(r), gl = srgbToLinear(g), bl = srgbToLinear(b);
+      // D65 illuminant
+      const X = (rl*0.4124564 + gl*0.3575761 + bl*0.1804375) / 0.95047;
+      const Y = (rl*0.2126729 + gl*0.7151522 + bl*0.0721750) / 1.00000;
+      const Z = (rl*0.0193339 + gl*0.1191920 + bl*0.9503041) / 1.08883;
+      const fx = labF(X), fy = labF(Y), fz = labF(Z);
+      return [116*fy - 16, 500*(fx-fy), 200*(fy-fz)];
+    }
+    function labDist(L1,a1,b1, L2,a2,b2) {
+      const dL=L1-L2, da=a1-a2, db=b1-b2;
+      return Math.sqrt(dL*dL + da*da + db*db);
+    }
+
+    // precompute Lab for every pixel
+    const labBuf = new Float32Array(w * h * 3);
+    for (let i = 0; i < w * h; i++) {
+      const [L,a,b] = rgbToLab(src[i*4], src[i*4+1], src[i*4+2]);
+      labBuf[i*3]=L; labBuf[i*3+1]=a; labBuf[i*3+2]=b;
+    }
+
+    // ── Flood fill from all border pixels ──
+    // mask: 0=unknown, 1=background, 2=foreground
+    const mask = new Uint8Array(w * h); // 0 = unvisited
+    const queue = [];
+
+    // seed: entire border
+    for (let x = 0; x < w; x++) { queue.push(x); queue.push(0); queue.push(x); queue.push(h-1); }
+    for (let y = 1; y < h-1; y++) { queue.push(0); queue.push(y); queue.push(w-1); queue.push(y); }
+
+    // For each seed, record its own Lab as the bg reference
+    // We sample the border colour to create a "bg palette"
+    // Then flood with tolerance against that seed's colour
+    const visited = new Uint8Array(w * h);
+
+    // collect unique border colours in Lab
+    const borderLabs = [];
+    for (let bi = 0; bi < queue.length; bi += 2) {
+      const x = queue[bi], y = queue[bi+1];
+      const idx = y * w + x;
+      if (src[idx*4+3] < 10) { visited[idx] = 1; mask[idx] = 1; continue; }
+      borderLabs.push([labBuf[idx*3], labBuf[idx*3+1], labBuf[idx*3+2]]);
+    }
+
+    // adaptive: pick the most representative border colour via simple median
+    function medianLab(labs) {
+      if (!labs.length) return [50,0,0];
+      const L = labs.map(l=>l[0]).sort((a,b)=>a-b);
+      const a = labs.map(l=>l[1]).sort((a,b)=>a-b);
+      const b = labs.map(l=>l[2]).sort((a,b)=>a-b);
+      const m = Math.floor(labs.length/2);
+      return [L[m], a[m], b[m]];
+    }
+    const [bL, ba, bb] = medianLab(borderLabs);
+
+    // BFS flood fill
+    const stack = [];
+    for (let bi = 0; bi < queue.length; bi += 2) {
+      const x = queue[bi], y = queue[bi+1];
+      const idx = y * w + x;
+      if (visited[idx]) continue;
+      visited[idx] = 1;
+      const d = labDist(labBuf[idx*3],labBuf[idx*3+1],labBuf[idx*3+2], bL,ba,bb);
+      if (d <= tol) { mask[idx] = 1; stack.push(idx); }
+    }
+
+    while (stack.length) {
+      const idx = stack.pop();
+      const x = idx % w, y = (idx / w) | 0;
+      const nb = [idx-1, idx+1, idx-w, idx+w];
+      const nx = [x-1,   x+1,   x,    x];
+      const ny = [y,     y,     y-1,  y+1];
+      for (let k = 0; k < 4; k++) {
+        const ni = nb[k];
+        if (nx[k]<0||nx[k]>=w||ny[k]<0||ny[k]>=h) continue;
+        if (visited[ni]) continue;
+        visited[ni] = 1;
+        const d = labDist(labBuf[ni*3],labBuf[ni*3+1],labBuf[ni*3+2], bL,ba,bb);
+        if (d <= tol) { mask[ni] = 1; stack.push(ni); }
+      }
+    }
+
+    // ── Morphological closing: fill small holes in bg mask (1px dilate then erode) ──
+    const mask2 = new Uint8Array(mask);
+    // dilate bg
+    for (let y=1;y<h-1;y++) for (let x=1;x<w-1;x++) {
+      if (mask[y*w+x]===1) {
+        mask2[(y-1)*w+x]=1; mask2[(y+1)*w+x]=1;
+        mask2[y*w+(x-1)]=1; mask2[y*w+(x+1)]=1;
+      }
+    }
+    // erode bg back
+    const mask3 = new Uint8Array(mask2);
+    for (let y=1;y<h-1;y++) for (let x=1;x<w-1;x++) {
+      if (mask2[y*w+x]===1) {
+        if (!mask2[(y-1)*w+x]||!mask2[(y+1)*w+x]||!mask2[y*w+(x-1)]||!mask2[y*w+(x+1)]) {
+          mask3[y*w+x]=0; // restore edge pixel to fg
+        }
+      }
+    }
+
+    // ── Feather: build float alpha, blur it along the bg/fg boundary ──
+    const alpha = new Float32Array(w * h);
+    for (let i = 0; i < w * h; i++) alpha[i] = mask3[i] ? 0.0 : 1.0;
+
+    // 1-pass box blur on alpha (radius 1) only near edges
+    const alphaB = new Float32Array(alpha);
+    for (let y=1;y<h-1;y++) for (let x=1;x<w-1;x++) {
+      // only blur if we're near a transition
+      const c = alpha[y*w+x];
+      const hasTransition = (
+        alpha[(y-1)*w+x]!==c || alpha[(y+1)*w+x]!==c ||
+        alpha[y*w+(x-1)]!==c || alpha[y*w+(x+1)]!==c
+      );
+      if (hasTransition) {
+        alphaB[y*w+x] = (
+          alpha[(y-1)*w+(x-1)] + alpha[(y-1)*w+x] + alpha[(y-1)*w+(x+1)] +
+          alpha[y*w+(x-1)]     + alpha[y*w+x]     + alpha[y*w+(x+1)] +
+          alpha[(y+1)*w+(x-1)] + alpha[(y+1)*w+x] + alpha[(y+1)*w+(x+1)]
+        ) / 9;
+      }
+    }
+
+    // ── Apply alpha to output ──
+    for (let i = 0; i < w * h; i++) {
+      const a = Math.round(alphaB[i] * (src[i*4+3]));
+      od[i*4+3] = a;
+    }
+    return out;
   }
 
   /* ── Lanczos ── */
